@@ -309,7 +309,9 @@ class VidLoad(App):
 
     #main-split  { height: 1fr; }
     #queue-panel { height: 1fr; padding: 0 2; }
-    #queue-title { height: 2; padding-top: 1; color: $text-muted; text-style: bold; }
+    #queue-header { height: 2; padding-top: 1; align: left middle; }
+    #queue-title  { color: $text-muted; text-style: bold; width: auto; margin-right: 2; }
+    #queue-hint   { color: $text-muted; width: 1fr; text-align: right; }
     DataTable    { height: 1fr; }
 
     #log-panel { height: 9; border-top: solid $primary; padding: 0 2; background: $panel; }
@@ -318,13 +320,14 @@ class VidLoad(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+p",  "preview",    "Preview"),
-        Binding("ctrl+v",  "paste_clip", "Paste"),
-        Binding("space",   "pause",      "Pause/Resume", show=False),
-        Binding("ctrl+d",  "clear_done", "Clear done"),
-        Binding("ctrl+l",  "toggle_log", "Toggle log"),
-        Binding("ctrl+q",  "quit",       "Quit"),
-        Binding("escape",  "clear_all",  "Clear"),
+        Binding("ctrl+p",  "preview",       "Preview"),
+        Binding("ctrl+v",  "paste_clip",    "Paste"),
+        Binding("space",   "pause",         "Pause/Resume", show=False),
+        Binding("ctrl+d",  "clear_done",    "Clear done"),
+        Binding("delete",  "delete_item",   "Delete row"),
+        Binding("ctrl+l",  "toggle_log",    "Toggle log"),
+        Binding("ctrl+q",  "quit",          "Quit"),
+        Binding("escape",  "clear_all",     "Clear"),
     ]
 
     def __init__(self):
@@ -332,8 +335,10 @@ class VidLoad(App):
         self.tasks: list[DownloadTask] = []
         self._active: DownloadTask | None = None
         self._current_info: MediaInfo | None = None
-        self._pause_event = threading.Event()
+        self._pause_event  = threading.Event()
         self._pause_event.set()
+        self._cancel_event = threading.Event()   # set → abort current download
+        self._spotdl_proc: subprocess.Popen | None = None
 
     # ── layout ───────────────────────────────────────────────────
 
@@ -365,7 +370,9 @@ class VidLoad(App):
         with Horizontal(id="main-split"):
             yield PreviewPanel(id="preview-panel")
             with Vertical(id="queue-panel"):
-                yield Label("━━  Download Queue", id="queue-title")
+                with Horizontal(id="queue-header"):
+                    yield Label("━━  Download Queue", id="queue-title")
+                    yield Label("[dim]↑↓ navigate   [bold]Del[/bold] remove[/dim]", id="queue-hint")
                 yield DataTable(id="queue-table", cursor_type="row", zebra_stripes=True)
 
         with Vertical(id="log-panel"):
@@ -450,6 +457,41 @@ class VidLoad(App):
         self.tasks = [t for t in self.tasks if t.status not in ("done", "error")]
         self._refresh_table()
         self._log("Cleared finished tasks.")
+
+    def action_delete_item(self):
+        """Remove the highlighted queue row; cancels it if currently downloading."""
+        table = self.query_one("#queue-table", DataTable)
+        row   = table.cursor_row          # 0-based index of highlighted row
+        if row < 0 or row >= len(self.tasks):
+            return
+        task = self.tasks[row]
+
+        if task is self._active:
+            # Signal the worker to abort, then reset progress UI
+            self._cancel_event.set()
+            self._pause_event.set()       # unblock if paused so the thread can see cancel
+            if self._spotdl_proc and self._spotdl_proc.poll() is None:
+                self._spotdl_proc.terminate()
+            self._log(f"✗ Cancelled: {task.title[:60]}")
+            self._active = None
+            self._cancel_event.clear()
+            self.query_one("#btn-pause",  Button).display = False
+            self._set_pause_btn(False)
+            self.query_one("#prog-label", Label).update("Idle")
+            self.query_one("#prog-bar",   ProgressBar).update(progress=0)
+            self.query_one("#prog-size",  Label).update("")
+            self.query_one("#prog-speed", Label).update("")
+        else:
+            self._log(f"✗ Removed: {task.title[:60]}")
+
+        self.tasks.pop(row)
+        self._refresh_table()
+        # keep cursor in bounds after deletion
+        new_count = len(self.tasks)
+        if new_count > 0:
+            table.move_cursor(row=min(row, new_count - 1))
+        # start next queued item if we just killed the active one
+        self._process_queue()
 
     def action_toggle_log(self):
         self.query_one("#log-panel").display ^= True
@@ -656,6 +698,7 @@ class VidLoad(App):
             self._active = nxt
             self.query_one("#btn-pause", Button).display = True
             self._pause_event.set()
+            self._cancel_event.clear()   # fresh start for new task
             if nxt.is_spotify:
                 self._run_spotify_download(nxt)
             else:
@@ -677,6 +720,8 @@ class VidLoad(App):
 
         def hook(d):
             self._pause_event.wait()   # blocks while paused
+            if self._cancel_event.is_set():
+                raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
 
             if d["status"] == "downloading":
                 task.status = "downloading"
@@ -733,6 +778,8 @@ class VidLoad(App):
                 ydl.download([task.url])
             task.status   = "done"
             task.progress = 100.0
+        except yt_dlp.utils.DownloadCancelled:
+            return   # task already removed from list by action_delete_item
         except Exception as e:
             task.status = "error"
             task.error  = str(e)
@@ -778,11 +825,16 @@ class VidLoad(App):
                     stderr=subprocess.STDOUT,
                     text=True,
                 )
+                self._spotdl_proc = proc
                 for line in proc.stdout:
+                    if self._cancel_event.is_set():
+                        proc.terminate()
+                        return
                     line = line.strip()
                     if line:
                         self.call_from_thread(self._log, f"[spotify] {line[:100]}")
                 proc.wait()
+                self._spotdl_proc = None
             except Exception as e:
                 self.call_from_thread(self._log, f"✗ {name[:40]}: {str(e)[:60]}")
 
